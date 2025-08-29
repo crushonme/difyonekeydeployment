@@ -9,7 +9,6 @@ IFS=$'\n\t'
 WORKDIR=/opt
 DIFY_DIR="$WORKDIR/dify"
 NGINX_CONF_DIR=/etc/nginx/conf.d
-DOCKER_SOURCE="auto"   # 可通过环境变量覆盖为 'distro' 或 'official'
 CONTAINER_CMD="docker"
 DOCKER_COMPOSE_CMD="docker compose"
 MIN_DOCKER_VERSION="20.10.0"
@@ -33,63 +32,205 @@ get_docker_version() {
   fi
 }
 
-install_docker_from_distro() {
-  log "尝试从发行版仓库安装 docker (distro)..."
-  if cmd_exists apt-get; then
-    apt-get update
-    apt-get install -y docker.io || return 1
-  elif cmd_exists dnf; then
-    dnf install -y docker || return 1
-    systemctl enable --now docker || true
-  elif cmd_exists yum; then
-    yum install -y docker || return 1
-    systemctl enable --now docker || true
+detect_os() {
+  log "检测操作系统版本..."
+  if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS_NAME="${ID}"
+    OS_VERSION="${VERSION_ID}"
+    log "检测到操作系统: ${OS_NAME} ${OS_VERSION}"
   else
+    err "无法检测操作系统版本"
     return 1
   fi
-  return 0
+}
+
+uninstall_old_docker() {
+  log "检查并卸载旧版本 Docker..."
+  # 卸载旧版本
+  for pkg in docker docker-engine docker.io containerd runc; do
+    if dpkg -l | grep -q "^ii  $pkg"; then
+      log "卸载旧包: $pkg"
+      apt-get remove -y "$pkg"
+    fi
+  done
+  if cmd_exists yum; then
+    log "卸载旧版本 Docker..."
+    yum remove -y docker \
+      docker-client \
+      docker-client-latest \
+      docker-common \
+      docker-latest \
+      docker-latest-logrotate \
+      docker-logrotate \
+      docker-engine
+  fi
+  log "旧版本 Docker 处理完成"
+}
+
+install_docker_ubuntu() {
+  log "开始在 Ubuntu 上安装 Docker..."
+  
+  # 更新 apt 包索引
+  log "更新 apt 包索引..."
+  apt-get update
+  
+  # 安装必要的依赖
+  log "安装必要的依赖包..."
+  apt-get install -y \
+    apt-transport-https \
+    ca-certificates \
+    curl \
+    gnupg \
+    lsb-release
+
+  # 添加 Docker 官方 GPG 密钥
+  log "添加 Docker 官方 GPG 密钥..."
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  
+  # 设置 Docker 仓库
+  log "设置 Docker 仓库..."
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+    $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  
+  # 更新 apt 包索引
+  log "更新包索引..."
+  apt-get update
+  
+  # 安装 Docker Engine
+  log "安装 Docker Engine、CLI、Containerd 和 Docker Compose..."
+  apt-get install -y \
+    docker-ce \
+    docker-ce-cli \
+    containerd.io \
+    docker-compose-plugin
+  
+  # 启动 Docker
+  log "启动并启用 Docker 服务..."
+  systemctl start docker
+  systemctl enable docker
+  
+  # 验证安装
+  log "验证 Docker 安装..."
+  if docker --version; then
+    log "Docker 安装成功！"
+  else
+    err "Docker 安装可能存在问题，请检查"
+    return 1
+  fi
+}
+
+install_docker_centos() {
+  log "开始在 CentOS 上安装 Docker..."
+  
+  # 安装所需的包
+  log "安装必要的依赖包..."
+  yum install -y yum-utils
+  
+  # 设置 Docker 仓库
+  log "设置 Docker 仓库..."
+  yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+  
+  # 安装 Docker Engine
+  log "安装 Docker Engine、CLI、Containerd 和 Docker Compose..."
+  yum install -y \
+    docker-ce \
+    docker-ce-cli \
+    containerd.io \
+    docker-compose-plugin
+  
+  # 启动 Docker
+  log "启动并启用 Docker 服务..."
+  systemctl start docker
+  systemctl enable docker
+  
+  # 验证安装
+  log "验证 Docker 安装..."
+  if docker --version; then
+    log "Docker 安装成功！"
+  else
+    err "Docker 安装可能存在问题，请检查"
+    return 1
+  fi
 }
 
 install_docker_from_official() {
   log "尝试使用 Docker 官方仓库安装 docker (official)..."
-  if cmd_exists apt-get; then
-    apt-get update
-    apt-get install -y ca-certificates curl gnupg lsb-release
-    DIST_ID=$(awk -F= '/^ID=/{print $2}' /etc/os-release | tr -d '"') || DIST_ID="ubuntu"
-    curl -fsSL "https://download.docker.com/linux/${DIST_ID}/gpg" | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/${DIST_ID} $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
-    apt-get update
-    apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin|| return 1
-  elif cmd_exists yum || cmd_exists dnf; then
-    yum install -y yum-utils
-    yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-    yum install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin|| return 1
-    systemctl enable --now docker || true
-  else
-    return 1
-  fi
+  
+  # 检测系统类型
+  detect_os || return 1
+  
+  # 卸载旧版本
+  uninstall_old_docker
+  
+  # 根据系统类型安装
+  case "${OS_NAME}" in
+    ubuntu)
+      install_docker_ubuntu
+      ;;
+    centos)
+      install_docker_centos
+      ;;
+    *)
+      err "不支持的操作系统: ${OS_NAME}"
+      return 1
+      ;;
+  esac
+  
+  # 安装成功后的提示
+  log "Docker 安装完成! 当前版本信息："
+  docker --version
+  docker compose version
+  log "Containerd 版本："
+  containerd --version
+  
+  # 显示 Docker 服务状态
+  log "Docker 服务状态："
+  systemctl status docker
+  
   return 0
 }
 
 install_docker() {
-  log "决定 Docker 安装来源（DOCKER_SOURCE=${DOCKER_SOURCE})..."
-  if [ "$DOCKER_SOURCE" = "distro" ]; then
-    install_docker_from_distro || { err "从发行版仓库安装 Docker 失败"; exit 1; }
-  elif [ "$DOCKER_SOURCE" = "official" ]; then
-    install_docker_from_official || { err "从官方仓库安装 Docker 失败"; exit 1; }
-  else
-    if install_docker_from_distro; then
-      ver=$(get_docker_version)
-      if [ -n "$ver" ] && ver_ge "$ver" "$MIN_DOCKER_VERSION"; then
-        log "检测到发行版 Docker 版本 $ver，满足最小要求，使用 distro 包。"
-      else
-        log "发行版 Docker 版本 ($ver) 不满足最小要求，尝试官方源安装。"
-        install_docker_from_official || { err "官方源安装失败"; exit 1; }
-      fi
+  log "开始 Docker 安装流程..."
+  
+  # 检查是否已安装 Docker
+  if cmd_exists docker; then
+    local current_version
+    current_version=$(get_docker_version)
+    log "检测到已安装 Docker，版本: $current_version"
+    
+    if [ -n "$current_version" ] && ver_ge "$current_version" "$MIN_DOCKER_VERSION"; then
+      log "当前 Docker 版本满足最低要求 ($MIN_DOCKER_VERSION)"
+      return 0
     else
-      log "发行版仓库无法安装 Docker，尝试官方源安装。"
-      install_docker_from_official || { err "官方源安装失败"; exit 1; }
+      log "当前 Docker 版本 ($current_version) 低于最低要求 ($MIN_DOCKER_VERSION)"
+      log "将尝试安装新版本..."
     fi
+  else
+    log "系统中未检测到 Docker，开始安装流程..."
+  fi
+  
+  # 总是使用官方安装方式
+  log "使用 Docker 官方推荐的安装方式..."
+  install_docker_from_official || {
+    err "Docker 安装失败。请检查以下几点："
+    err "1. 确保系统支持（Ubuntu 或 CentOS）"
+    err "2. 检查网络连接是否正常"
+    err "3. 确保有足够的磁盘空间"
+    err "4. 查看系统日志获取详细错误信息：journalctl -xeu docker"
+    exit 1
+  }
+  
+  # 安装完成后进行简单的 Docker 测试
+  log "执行 Docker 测试..."
+  if docker run --rm hello-world; then
+    log "✅ Docker 安装并运行正常！"
+  else
+    err "Docker 安装可能存在问题，hello-world 测试失败"
+    exit 1
   fi
 }
 
@@ -139,30 +280,114 @@ detect_container_runtime() {
   fi
 }
 
+check_system_requirements() {
+  log "检查系统要求..."
+  
+  # 检查内存
+  local total_mem
+  total_mem=$(free -m | awk '/^Mem:/{print $2}')
+  log "系统总内存: ${total_mem}MB"
+  if [ "${total_mem}" -lt 2048 ]; then
+    err "系统内存不足。建议至少2GB内存"
+    exit 1
+  fi
+  
+  # 检查磁盘空间
+  local free_space
+  free_space=$(df -m /opt | awk 'NR==2 {print $4}')
+  log "可用磁盘空间: ${free_space}MB"
+  if [ "${free_space}" -lt 10240 ]; then
+    err "磁盘空间不足。建议至少10GB可用空间"
+    exit 1
+  fi
+  
+  # 检查网络连接
+  log "检查网络连接..."
+  local urls=(
+    "download.docker.com"
+    "github.com"
+    "raw.githubusercontent.com"
+  )
+  
+  for url in "${urls[@]}"; do
+    if ! ping -c 1 "$url" &>/dev/null; then
+      err "无法连接到 $url，请检查网络连接"
+      return 1
+    fi
+  done
+  
+  log "系统要求检查通过"
+  return 0
+}
+
+check_ports() {
+  log "检查必要端口..."
+  local ports=(80 443 "${DIFY_PORT}")
+  
+  for port in "${ports[@]}"; do
+    if lsof -i:"${port}" | grep -q LISTEN; then
+      err "端口 ${port} 已被占用"
+      lsof -i:"${port}"
+      return 1
+    fi
+  done
+  
+  log "所需端口均可用"
+  return 0
+}
+
 install_prereqs() {
   log "开始安装/检测依赖：docker / docker compose / nginx / git / curl / acme.sh ..."
+  
+  # 系统检查
+  check_system_requirements || exit 1
+  
+  # 检查必要端口
+  check_ports || exit 1
+  
+  # 检测并安装容器运行时
   detect_container_runtime
-
+  
+  # 设置 Docker 用户组
+  if ! getent group docker >/dev/null; then
+    log "创建 docker 用户组..."
+    groupadd docker
+  fi
+  log "将当前用户添加到 docker 用户组..."
+  usermod -aG docker "${SUDO_USER:-$USER}"
+  
   if ! cmd_exists nginx; then
     log "安装 nginx..."
     if cmd_exists apt-get; then
-      apt-get update && apt-get install -y nginx
+      apt-get update
+      apt-get install -y nginx
     elif cmd_exists dnf; then
       dnf install -y nginx
     elif cmd_exists yum; then
-      yum install -y epel-release && yum install -y nginx
+      yum install -y epel-release
+      yum install -y nginx
     fi
     systemctl enable --now nginx || true
   else
-    log "检测到 nginx 已安装。"
+    log "检测到 nginx 已安装"
   fi
-
-  for pkg in git curl; do
-    if ! cmd_exists $pkg; then
+  
+  # 安装其他必要工具
+  local packages=(git curl wget lsof)
+  for pkg in "${packages[@]}"; do
+    if ! cmd_exists "$pkg"; then
       log "安装 $pkg ..."
-      if cmd_exists apt-get; then apt-get update && apt-get install -y $pkg; elif cmd_exists dnf; then dnf install -y $pkg; elif cmd_exists yum; then yum install -y $pkg; fi
+      if cmd_exists apt-get; then
+        apt-get update && apt-get install -y "$pkg"
+      elif cmd_exists dnf; then
+        dnf install -y "$pkg"
+      elif cmd_exists yum; then
+        yum install -y "$pkg"
+      fi || { err "$pkg 安装失败"; exit 1; }
     fi
   done
+  
+  log "所有依赖安装完成"
 }
 
 install_acme_sh() {
@@ -247,6 +472,7 @@ deploy_dify() {
   log "显示 .env 中相关行："
   grep -E "^EXPOSE_NGINX_PORT|^EXPOSE_NGINX_SSL_PORT" .env || true
 
+  systemctl status docker | grep "active (running)" >/dev/null 2>&1 || { systemctl start docker || {err "Docker 未运行，请检查 Docker 服务"; return 1; }}
   log "使用 Docker Compose 启动 Dify（使用修改后的 .env）..."
   docker compose up -d || { err "Dify 启动失败，请查看日志 (docker compose logs)"; return 1; }
   log "Dify 容器已启动。"
@@ -320,27 +546,111 @@ issue_and_install_cert() {
   log "$domain 的证书已安装到 $cert_dir"
 
   cat > "$NGINX_CONF_DIR/${domain}.ssl.conf" <<NGSSL
+# SSL 配置
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_prefer_server_ciphers on;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+ssl_session_tickets off;
+ssl_stapling on;
+ssl_stapling_verify on;
+resolver 8.8.8.8 8.8.4.4 valid=300s;
+resolver_timeout 5s;
+
+# HSTS 设置（根据需要启用）
+#add_header Strict-Transport-Security "max-age=63072000" always;
+
 server {
-    listen 443 ssl;
+    listen 443 ssl http2;
     server_name $domain;
 
+    # SSL 证书配置
     ssl_certificate /etc/letsencrypt/$domain/fullchain.cer;
     ssl_certificate_key /etc/letsencrypt/$domain/$domain.key;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
+    ssl_buffer_size 8k;
 
+    # 安全头部
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+    add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;
+    add_header Permissions-Policy "interest-cohort=()" always;
+
+    # 日志配置
+    access_log /var/log/nginx/\$host.access.log combined buffer=512k flush=1m;
+    error_log /var/log/nginx/\$host.error.log warn;
+
+    # 代理设置
     location / {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
+        
+        # WebSocket 支持
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # 超时设置
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+        
+        # 代理缓冲设置
+        proxy_buffering on;
+        proxy_buffer_size 8k;
+        proxy_buffers 8 32k;
+        proxy_busy_buffers_size 64k;
+        
         proxy_pass http://127.0.0.1:${DIFY_PORT};
+    }
+
+    # 禁止访问隐藏文件
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
     }
 }
 NGSSL
 
   nginx -t && service nginx reload || err "nginx 重载失败（证书安装后）。"
 }
+
+cleanup() {
+  local exit_code=$?
+  if [ $exit_code -ne 0 ]; then
+    log "检测到安装失败，开始清理..."
+    
+    # 停止并删除所有运行的容器
+    if cmd_exists docker; then
+      log "停止并删除相关Docker容器..."
+      docker ps -a | grep "dify" | awk '{print $1}' | xargs -r docker rm -f
+    fi
+    
+    # 删除创建的nginx配置
+    if [ -f "$NGINX_CONF_DIR/redirecthttp2https.conf" ]; then
+      log "删除Nginx配置..."
+      rm -f "$NGINX_CONF_DIR/redirecthttp2https.conf"
+      rm -f "$NGINX_CONF_DIR/${DIFY_HOST}.ssl.conf"
+      systemctl reload nginx
+    fi
+    
+    # 恢复备份的文件
+    if [ -f "$DIFY_DIR/docker/docker-compose.yaml.bak" ]; then
+      log "恢复备份文件..."
+      mv "$DIFY_DIR/docker/docker-compose.yaml.bak" "$DIFY_DIR/docker/docker-compose.yaml"
+    fi
+    
+    log "清理完成。请检查错误信息并重试安装。"
+  fi
+}
+
+# 设置trap以在脚本退出时进行清理
+trap cleanup EXIT
 
 main() {
   usage() {
