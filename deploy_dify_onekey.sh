@@ -188,7 +188,7 @@ install_docker_from_official() {
   
   # 显示 Docker 服务状态
   log "Docker 服务状态："
-  systemctl status docker
+  systemctl is-active --quiet docker && log "Docker 运行中" || err "Docker 未运行"
   
   return 0
 }
@@ -472,7 +472,17 @@ deploy_dify() {
   log "显示 .env 中相关行："
   grep -E "^EXPOSE_NGINX_PORT|^EXPOSE_NGINX_SSL_PORT" .env || true
 
-  systemctl status docker | grep "active (running)" >/dev/null 2>&1 || { systemctl start docker || {err "Docker 未运行，请检查 Docker 服务"; return 1; }}
+  if ! systemctl is-active --quiet docker; then
+  log "Docker 服务未运行，正在尝试启动..."
+  if ! systemctl start docker; then
+    err "无法启动 Docker 服务，请检查："
+    err "1. Docker 是否已正确安装"
+    err "2. systemctl 是否有权限访问"
+    err "3. 查看详细日志: journalctl -u docker --no-pager -n 50"
+    return 1
+  fi
+  log "Docker 服务已成功启动"
+fi
   log "使用 Docker Compose 启动 Dify（使用修改后的 .env）..."
   docker compose up -d || { err "Dify 启动失败，请查看日志 (docker compose logs)"; return 1; }
   log "Dify 容器已启动。"
@@ -546,19 +556,6 @@ issue_and_install_cert() {
   log "$domain 的证书已安装到 $cert_dir"
 
   cat > "$NGINX_CONF_DIR/${domain}.ssl.conf" <<NGSSL
-# SSL 配置
-ssl_protocols TLSv1.2 TLSv1.3;
-ssl_prefer_server_ciphers on;
-ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
-ssl_session_tickets off;
-ssl_stapling on;
-ssl_stapling_verify on;
-resolver 8.8.8.8 8.8.4.4 valid=300s;
-resolver_timeout 5s;
-
-# HSTS 设置（根据需要启用）
-#add_header Strict-Transport-Security "max-age=63072000" always;
-
 server {
     listen 443 ssl http2;
     server_name $domain;
@@ -566,9 +563,6 @@ server {
     # SSL 证书配置
     ssl_certificate /etc/letsencrypt/$domain/fullchain.cer;
     ssl_certificate_key /etc/letsencrypt/$domain/$domain.key;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
-    ssl_buffer_size 8k;
 
     # 安全头部
     add_header X-Frame-Options "SAMEORIGIN" always;
@@ -706,15 +700,17 @@ USAGE
   case "$cmd" in
     all)
       require_root
+      collect_input
       install_prereqs
       install_acme_sh
-      collect_input
+
       deploy_dify || log "Dify 部署失败"
       setup_nginx || true
       run_certs || true
       ;;
     prereqs)
       require_root
+      collect_input
       install_prereqs
       ;;
     acme)
@@ -755,6 +751,5 @@ USAGE
       ;;
   esac
 }
-
 
 main "$@"
